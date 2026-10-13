@@ -35,7 +35,25 @@ CUR_TTY=/dev/tty0
 $ESUDO chmod 666 $CUR_TTY 2>/dev/null
 
 
-GAMEDIR="/$directory/ports/swd3de"
+# GAMEDIR：PortMaster 标准写法（$directory 由 control.txt 注入）。
+# 目录名在两个 CFW 上不同：ROCKNIX 用 sword3/，EmuELEC 用 swd3de/（同一份内容）。
+# 故按"哪个目录里真有 libSWD3E.so"来选，而不是按名字：sword3 优先，swd3de 兜底。
+# 另：脱离 PortMaster 直接 bash 执行（SSH 手工跑）时 $directory 未定义会拼成
+# "/ports/..."，故再按脚本自身位置与常见绝对路径兜底。
+GAMEDIR=""
+_self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+for _c in "/$directory/ports/sword3" "/$directory/ports/swd3de" \
+          "$_self/sword3" "$_self/swd3de" \
+          "/storage/roms/ports/sword3" "/storage/roms/ports/swd3de" \
+          "/roms/ports/sword3" "/roms/ports/swd3de"; do
+  if [ -f "$_c/libSWD3E.so" ]; then GAMEDIR="$_c"; break; fi
+done
+if [ -z "$GAMEDIR" ]; then
+  echo "swd3de: 未找到游戏目录（缺少 libSWD3E.so）。已尝试 /$directory/ports/{sword3,swd3de}" >&2
+  echo "        $_self/{sword3,swd3de} /storage/roms/ports/{sword3,swd3de}" >&2
+  exit 1
+fi
+echo "gamedir: $GAMEDIR"
 cd "$GAMEDIR"
 
 # 缩短绝对路径（修复 isAnySlotExist() 栈 canary 溢出 → abort sig=6）：
@@ -48,10 +66,49 @@ cd "$GAMEDIR"
 # 改用 bind mount：argv[0] 与 /proc/self/exe 都得到短路径 /tmp/s3，彻底覆盖两条取基址来源；
 # 同时让 gdb 等不会因 symlink 被 canonicalize 而失真。mount 不可用时回退 symlink。
 SHORTLINK="/tmp/s3"
-umount "$SHORTLINK/Music" 2>/dev/null
-umount "$SHORTLINK" 2>/dev/null; rm -rf "$SHORTLINK"
+
+# ── 安全清理挂载点（防误删真实游戏目录）──────────────────────────────────
+# [事故 2026-10-14] 原写法 `umount "$SHORTLINK"; rm -rf "$SHORTLINK"` 在 umount
+# 失败时（子挂载 busy、或历史上叠加了多份 bind 没卸干净）会顺着仍然生效的
+# bind mount 把 GAMEDIR 的真实内容整个删掉 —— ROCKNIX 上就是这样一次丢光了
+# sword3/ 的全部 .so、二进制、存档与 assets。
+# 故三步保险：① 先卸子挂载（assets / Music）；② 反复 umount 直到确实不再是
+# 挂载点（mountinfo 里同一挂载点可能叠加多份）；③ 只有"不是挂载点"且
+# "inode 不等于 GAMEDIR" 时才允许 rm -rf。
+is_mountpoint() {
+  awk -v p="$1" '$5 == p { found = 1 } END { exit !found }' /proc/self/mountinfo 2>/dev/null
+}
+umount_deep() {                       # 返回 0 = 已不再是挂载点
+  local d="$1" i=0
+  is_mountpoint "$d" || return 0
+  while [ $i -lt 8 ]; do
+    umount "$d" 2>/dev/null || break
+    i=$((i + 1))
+    is_mountpoint "$d" || return 0
+  done
+  return 1                            # 仍是挂载点
+}
+safe_rmdir() {
+  local d="$1"
+  [ -e "$d" ] || return 0
+  if is_mountpoint "$d"; then
+    echo "warn: $d 仍是挂载点，跳过删除（防误删游戏目录）" >&2
+    return 0
+  fi
+  if [ -n "$GAMEDIR" ] &&
+     [ "$(stat -c '%d:%i' "$d" 2>/dev/null)" = "$(stat -c '%d:%i' "$GAMEDIR" 2>/dev/null)" ]; then
+    echo "warn: $d 与 GAMEDIR 同一 inode，跳过删除" >&2
+    return 0
+  fi
+  rm -rf "$d"
+}
+
+umount_deep "$SHORTLINK/assets"
+umount_deep "$SHORTLINK/Music"
+umount_deep "$SHORTLINK"
+safe_rmdir "$SHORTLINK"
 if ! ( mkdir -p "$SHORTLINK" && mount --bind "$GAMEDIR" "$SHORTLINK" ) 2>/dev/null; then
-  rm -rf "$SHORTLINK"; ln -s "$GAMEDIR" "$SHORTLINK"
+  safe_rmdir "$SHORTLINK"; ln -s "$GAMEDIR" "$SHORTLINK"
 fi
 export ANDROID_APP_PATH="$SHORTLINK/sword3"
 GAMEDIR="$SHORTLINK"
