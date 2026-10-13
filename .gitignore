@@ -23,8 +23,10 @@ debug.log
 
 # 从测试设备拉回的取证产物（崩溃日志 / 设备侧二进制副本），仅本地分析用，不入库
 logs/
-tools/uinput_y_press
-tools/uinput_y_press.exe
+# 部署前从设备拉回的原始二进制备份（含游戏 .so，体积大），仅本地留档
+backup/
+tools/uinput_pad
+tools/uinput_pad.exe
 tools/aarch64_tmp/
 
 # 误用脚手架反例（不应入库；原 PROGRESS/HANDOFF 称其已 git-ignored，实际未被忽略）

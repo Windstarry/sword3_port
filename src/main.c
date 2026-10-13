@@ -261,7 +261,16 @@ static void *sw_sym(const char *name) {
 
 static int *sw_menu_select(void) {
   static int *p;
-  if (!p) p = (int *)sw_sym("MainMenu_selectitem");
+  /* 两套 libSWD3E.so 对该变量命名不同，两个名字都试：
+   *   参考版 4375fb6a：MainMenu_selectitem(0x16C824) + M/R/G/I/k/Aselectitem 紧随其后
+   *   本仓库 037a9e92：selectitem(0x1822B0)          + 同样顺序的一串 *selectitem
+   * 布局完全一致，只是数组首元素名字不同；找不到就保持 NULL 让调用方判空。
+   * （不缓存"已失败"：so 尚未加载时 sw_sym 一律返回 0，需要每次重试。） */
+  if (!p) {
+    p = (int *)sw_sym("MainMenu_selectitem");
+    if (!p)
+      p = (int *)sw_sym("selectitem");
+  }
   return p;
 }
 
@@ -1722,6 +1731,228 @@ static void sw_title_credit_present(void *renderer) {
   }
 }
 
+/* 手柄→键盘注入用的自定义事件类型（SDL_RegisterEvents 在启动输入线程前注册）。
+ * 输入线程只用它把"该注入哪个键、按下还是松开"递给游戏主线程，真正的注入
+ * （调用 SDLINPUT::UpdateKeyStatus）在主线程执行，避免并发写 DINPUT。 */
+static Uint32 g_key_ev = (Uint32)-1;
+
+/* ---------------------------------------------------------------------------
+ * 手柄 → 键盘注入（本端口在重构中丢失的一层）
+ *
+ * 为什么需要：libSWD3E.so 是纯鼠标/键盘 RPG —— 其 .dynsym 中零个
+ * SDL_Joystick* / SDL_GameController* 导入，手柄事件对它毫无意义，
+ * 必须由 loader 翻译。src/android_shim.c 里那条"手柄 → Android MotionEvent"
+ * 通道对本游戏是死代码（游戏不走 AInputQueue）。
+ *
+ * 注入通道选型（关键，踩过坑）：
+ *   ❌ 直接推 SDL_KEYDOWN/SDL_KEYUP 事件 —— 实测无效（EE47 实机：loader 确实
+ *      注入了 44 次，日志有 [pad] 记录，但游戏毫无反应）。原因：SDL_PushEvent
+ *      只把事件放进队列，**不会更新 SDL_GetKeyboardState 的内部状态数组**
+ *      （那个数组由 SDL 内部 SDL_SendKeyboardKey 维护），而本游戏正是用
+ *      SDL_GetKeyboardState + SDLINPUT::UpdateKeyStatus 轮询按键。
+ *      （游戏虽也有 PlayConsole(SDL_Event*) 处理 SDL_KEYUP，但那只覆盖个别
+ *       特殊键，不是主输入链路。）
+ *   ✅ 最终方案：输入线程只通过【自定义 SDL_UserEvent】把"注入哪个键、按下/
+ *      松开"递给主线程，由 sw_SDL_PollEvent 在游戏主线程调用
+ *      SDLINPUT::UpdateKeyStatus(DINPUT, key, down)。这样既线程安全
+ *      （不并发写 1384B 的 DINPUT 实例），又真正落到游戏按键状态上。
+ *      两套 so 的符号名不同（037a9e92 只有 ...E12SDL_Scancodeb、4375fb6a
+ *      另有 ...Eib），两个都试，都失败才退回推 SDL 键盘事件兜底。
+ *
+ * 键位依据：so 内 gkeyMapping（逻辑键 id → SDL scancode，由 KeyMappingSetup
+ * 初始化）实测 id3=LEFT id4=UP id5=RIGHT id6=DOWN id12=RETURN id0=ESCAPE
+ * id1=SPACE，与常规 PC 操作一致。
+ * ------------------------------------------------------------------------- */
+
+#define SWK_PULSE_MS   70   /* 单个脉冲按下保持时长：至少覆盖一帧采样 */
+#define SWK_FIRST_MS  400   /* 按住多久后开始连发 */
+#define SWK_REPEAT_MS 140   /* 连发间隔 */
+#define SWK_AXIS_DEAD 16000 /* 摇杆死区 */
+
+enum { SWK_UP = 0, SWK_DOWN, SWK_LEFT, SWK_RIGHT, SWK_OK, SWK_COUNT };
+
+typedef struct {
+  SDL_Scancode sc;   /* 给 UpdateKeyStatus(SDL_Scancode,bool) 用 */
+  SDL_Keycode  kc;   /* 兜底推 SDL 键盘事件时用 */
+  int          id;   /* 给 UpdateKeyStatus(int,bool) 用（gkeyMapping 逻辑键 id） */
+  const char  *tag;
+  int          prev;      /* 上一采样周期手柄是否按住 */
+  int          down;      /* 已注入 keydown、待注入 keyup */
+  int          first;     /* 本次按下尚未连发过 */
+  Uint32       next_down; /* 下次允许注入 keydown 的时刻 */
+  Uint32       up_at;     /* 注入 keyup 的时刻 */
+} sw_padkey;
+
+/* 逻辑键 id 取自 so 内 gkeyMapping（由 KeyMappingSetup 初始化）：
+ *   id3=LEFT id4=UP id5=RIGHT id6=DOWN id12=RETURN id0=ESCAPE id1=SPACE */
+static sw_padkey g_padkey[SWK_COUNT] = {
+    {SDL_SCANCODE_UP,     SDLK_UP,      4,  "UP",    0, 0, 0, 0, 0},
+    {SDL_SCANCODE_DOWN,   SDLK_DOWN,    6,  "DOWN",  0, 0, 0, 0, 0},
+    {SDL_SCANCODE_LEFT,   SDLK_LEFT,    3,  "LEFT",  0, 0, 0, 0, 0},
+    {SDL_SCANCODE_RIGHT,  SDLK_RIGHT,   5,  "RIGHT", 0, 0, 0, 0, 0},
+    {SDL_SCANCODE_RETURN, SDLK_RETURN, 12,  "OK(A)", 0, 0, 0, 0, 0},
+};
+
+/* 真正把按键写进游戏：调用 SDLINPUT::UpdateKeyStatus(DINPUT, key, down)。
+ *
+ * 两套 so 的符号名不同，两个都试：
+ *   本仓库 037a9e92：_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb（传 scancode）
+ *   参考版 4375fb6a：另有 _ZN8SDLINPUT15UpdateKeyStatusEib（传逻辑键 id）
+ * 两者都找不到时退回推 SDL 键盘事件（保底，至少能被 SDL_PollEvent 路径看到）。 */
+static void sw_key_inject(const sw_padkey *k, int down) {
+  void *din = sw_sym("DINPUT");
+  void (*upd)(void *, int, int);
+  SDL_Event e;
+  SDL_Window *w;
+
+  upd = (void (*)(void *, int, int))sw_sym(
+      "_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb");
+  if (din && upd) {
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      debugPrintf("[pad] inject via UpdateKeyStatus(SDL_Scancode) DINPUT=%p\n",
+                  din);
+    }
+    upd(din, (int)k->sc, down);
+    return;
+  }
+  upd = (void (*)(void *, int, int))sw_sym(
+      "_ZN8SDLINPUT15UpdateKeyStatusEib");
+  if (din && upd) {
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      debugPrintf("[pad] inject via UpdateKeyStatus(int id) DINPUT=%p\n", din);
+    }
+    upd(din, k->id, down);
+    return;
+  }
+  {
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      debugPrintf("[pad] WARN: no UpdateKeyStatus symbol (DINPUT=%p) -> "
+                  "fallback SDL keyboard event\n", din);
+    }
+  }
+  memset(&e, 0, sizeof(e));
+  e.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+  e.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+  e.key.repeat = 0;
+  e.key.keysym.scancode = k->sc;
+  e.key.keysym.sym = k->kc;
+  e.key.keysym.mod = 0;
+  w = egl_shim_get_window();
+  if (w)
+    e.key.windowID = SDL_GetWindowID(w);
+  SDL_PushEvent(&e);
+}
+
+/* 输入线程 → 主线程：只投递"注入请求"，不直接碰游戏状态。 */
+static void sw_push_key(const sw_padkey *k, int down) {
+  SDL_Event e;
+
+  if (g_key_ev == (Uint32)-1)
+    return;
+  memset(&e, 0, sizeof(e));
+  e.type = g_key_ev;
+  e.user.code = (Sint32)(k - g_padkey);
+  e.user.data1 = (void *)(long)down;
+  SDL_PushEvent(&e);
+}
+
+/* 单键状态机：按下沿立即发一个"按下脉冲"（down → SWK_PULSE_MS 后 up，
+ * 保证游戏至少采样到一个 keydown）；按住超过 SWK_FIRST_MS 后按
+ * SWK_REPEAT_MS 连发；松开沿收尾。 */
+static void sw_padkey_step(sw_padkey *k, int held, Uint32 now) {
+  if (held && !k->prev) {              /* 按下沿 */
+    k->first = 1;
+    k->next_down = now;
+    debugPrintf("[pad] %s -> key down (scancode %d)\n", k->tag, k->sc);
+  }
+  if (!held && k->prev)                /* 松开沿 */
+    k->next_down = 0;
+  k->prev = held;
+
+  if (k->down && now >= k->up_at) {    /* 脉冲收尾 */
+    sw_push_key(k, 0);
+    k->down = 0;
+  }
+  if (held && !k->down && k->next_down && now >= k->next_down) {
+    sw_push_key(k, 1);
+    k->down = 1;
+    k->up_at = now + SWK_PULSE_MS;
+    k->next_down = now + (k->first ? SWK_FIRST_MS : SWK_REPEAT_MS);
+    k->first = 0;
+  }
+}
+
+/* 所有已连接手柄（掌机内置 + 后插入的 USB/uinput 手柄）。按 joystick index
+ * 定位，每个周期补开新出现的设备——虚拟手柄是热插拔的，只在启动瞬间扫一次
+ * 会漏掉它（回归验证踩过这个坑）。 */
+#define SW_MAX_PADS 4
+static SDL_GameController *g_pads[SW_MAX_PADS];
+
+static void sw_pads_refresh(void) {
+  int n = SDL_NumJoysticks();
+
+  if (n > SW_MAX_PADS)
+    n = SW_MAX_PADS;
+  for (int i = 0; i < n; i++) {
+    if (g_pads[i] || !SDL_IsGameController(i))
+      continue;
+    g_pads[i] = SDL_GameControllerOpen(i);
+    if (g_pads[i])
+      debugPrintf("[input] pad opened (idx=%d) %s\n", i,
+                  SDL_GameControllerName(g_pads[i]));
+  }
+}
+
+static void sw_pad_poll_keys(void) {
+  Uint32 now = SDL_GetTicks();
+  int held[SWK_COUNT];
+  int i;
+
+  for (i = 0; i < SWK_COUNT; i++)
+    held[i] = 0;
+
+  /* 战斗撤退/自动（extra）菜单的 DPAD 与 A 由 sw_handle_extra_pad 独占处理，
+   * 这里必须让路，否则会双重触发。 */
+  if (!sw_cmd_extra_active()) {
+    for (int p = 0; p < SW_MAX_PADS; p++) {
+      SDL_GameController *pad = g_pads[p];
+      Sint16 ax, ay;
+
+      if (!pad)
+        continue;
+      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP))
+        held[SWK_UP] = 1;
+      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))
+        held[SWK_DOWN] = 1;
+      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))
+        held[SWK_LEFT] = 1;
+      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))
+        held[SWK_RIGHT] = 1;
+      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A))
+        held[SWK_OK] = 1;
+      /* 左摇杆同样映射为方向（掌机常见操作习惯） */
+      ax = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+      ay = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+      if (ay < -SWK_AXIS_DEAD)
+        held[SWK_UP] = 1;
+      if (ay > SWK_AXIS_DEAD)
+        held[SWK_DOWN] = 1;
+      if (ax < -SWK_AXIS_DEAD)
+        held[SWK_LEFT] = 1;
+      if (ax > SWK_AXIS_DEAD)
+        held[SWK_RIGHT] = 1;
+    }
+  }
+  for (i = 0; i < SWK_COUNT; i++)
+    sw_padkey_step(&g_padkey[i], held[i], now);
+}
+
 static void sw_overlay_present(void *renderer) {
   sw_title_credit_present(renderer);
   sw_cheat_present(renderer);
@@ -1745,7 +1976,24 @@ static void sw_push_right_click(int down) {
 }
 
 int sw_SDL_PollEvent(SDL_Event *ev) {
-  int r = SDL_PollEvent(ev);
+  int r;
+
+  /* 先消费掉输入线程投递的"键注入请求"：在这里（游戏主线程）调用
+   * SDLINPUT::UpdateKeyStatus，再把真正的 SDL 事件交给游戏。自定义事件本身
+   * 不下发给游戏。 */
+  for (;;) {
+    r = SDL_PollEvent(ev);
+    if (r <= 0)
+      break;
+    if (ev->type == g_key_ev) {
+      int idx = ev->user.code;
+      int down = (int)(long)ev->user.data1;
+      if (idx >= 0 && idx < SWK_COUNT)
+        sw_key_inject(&g_padkey[idx], down);
+      continue;
+    }
+    break;
+  }
   sw_lvup_on_frame();
   sw_try_enter_item_bag();
   if (r > 0 &&
@@ -1790,31 +2038,24 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
 
 static void *sw_input_thread(void *arg) {
   (void)arg;
-  SDL_GameController *pad = NULL;
   for (;;) {
     SDL_GameControllerUpdate();
-    if (!pad) {
-      int n = SDL_NumJoysticks();
-      for (int i = 0; i < n; i++) {
-        if (SDL_IsGameController(i)) {
-          pad = SDL_GameControllerOpen(i);
-          if (pad) {
-            debugPrintf("[input] pad opened (idx=%d) %s\n", i,
-                        SDL_GameControllerName(pad));
-            break;
-          }
-        }
-      }
-    }
-    if (pad) {
-      int start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
-      int back = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+    sw_pads_refresh();
+    for (int p = 0; p < SW_MAX_PADS; p++) {
+      SDL_GameController *pad = g_pads[p];
+      int start, back;
+
+      if (!pad)
+        continue;
+      start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
+      back = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
       if (start && back) {
         static const char msg[] = "[pad] SELECT+START -> exit\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         _exit(0);
       }
     }
+    sw_pad_poll_keys();
     SDL_Delay(16);
   }
   return NULL;
@@ -1959,9 +2200,13 @@ int main(int argc, char *argv[]) {
    *    不给设备 SDL2 设 SDL_VIDEODRIVER（铁律）。 */
   setup_device_sdl_video();
 
-  /* 后台线程只做 SELECT+START 退出。手柄事件交给 2023 版 libSWD3E.so。 */
+  /* 后台线程：SELECT+START 退出 + 手柄→键盘注入（手柄事件本身游戏不认，
+   * 见 sw_pad_poll_keys 处的说明）。 */
   {
     pthread_t tid;
+    g_key_ev = SDL_RegisterEvents(1);
+    if (g_key_ev == (Uint32)-1)
+      debugPrintf("[pad] SDL_RegisterEvents failed: %s\n", SDL_GetError());
     if (pthread_create(&tid, NULL, sw_input_thread, NULL) == 0)
       pthread_detach(tid);
   }

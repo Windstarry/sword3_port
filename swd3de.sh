@@ -135,7 +135,24 @@ fi
 if [ -f "$GAMEDIR/libandroid.so" ]; then
   ln -sf "$GAMEDIR/libandroid.so" "$STAGING/libandroid.so"
 fi
-export LD_LIBRARY_PATH="$STAGING:$GAMEDIR:/usr/lib:/usr/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# ── 厂商 GL/EGL 目录（EmuELEC 特有，绝不能丢）──────────────────────────────
+# EmuELEC(Amlogic/RK) 把 Mali 的 libEGL.so / libGLESv2.so / libgbm.so 单独放在
+# /usr/lib/libmali/ 下，而 /usr/lib/libEGL.so 往往是 mesa 或 GLVND 转发库。
+# 若不在 LD_LIBRARY_PATH 最前显式带上该目录，设备 SDL2 创建窗口时 dlopen 到的
+# 是 mesa/GLVND 那份 → "Can't load EGL/GL library on window creation."
+# → SDL_CreateWindow 失败 → SDL_main 返回 2 → 进程退出即"闪退"。
+# ROCKNIX 没有这个目录（EGL 直接在 /usr/lib），故按存在与否探测，两系统通用。
+# [踩坑 2026-10-14] 曾误删该前缀，EE47 上表现为进游戏即闪退。
+MALI_DIR=""
+for d in /usr/lib/libmali /usr/lib/mali /usr/lib/aarch64-linux-gnu/mali; do
+  if [ -d "$d" ]; then MALI_DIR="$d"; break; fi
+done
+if [ -n "$MALI_DIR" ]; then
+  export LD_LIBRARY_PATH="$MALI_DIR:$STAGING:$GAMEDIR:/usr/lib:/usr/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+else
+  export LD_LIBRARY_PATH="$STAGING:$GAMEDIR:/usr/lib:/usr/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+echo "gl: vendor dir ${MALI_DIR:-<none>}"
 
 # 中文 locale：资源内含 zh-Hans / zh-Hant 两套。默认简体；繁体改 zh_TW.UTF-8。
 # 需系统已生成对应 locale（locale -a 可见）；否则 C.UTF-8 兜底。
@@ -150,6 +167,30 @@ export LC_ALL="$LANG"
 
 # 关闭调试光标角标（egl_shim 默认画一个十字；2D 游戏自带光标，关掉）。
 export SUMMERTIME_CURSOR=0
+
+# 手柄映射库：参考构建 sword3.sh 与 ROCKNIX 复现脚本都会显式设置并打印，本脚本
+# 原先没有这一段，导致 EE / ROCKNIX 两个环境的 SDL 手柄识别条件不一致（诊断时
+# 无法确认用的哪份映射）。PortMaster 通常在 control.txt 里已注入该变量，这里只作
+# 兜底；无论来源都打印一行，便于在 debug.log 里核对。
+if [ -f /opt/inttools/gamecontrollerdb.txt ]; then
+  export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
+elif [ -z "${SDL_GAMECONTROLLERCONFIG_FILE:-}" ]; then
+  for f in \
+      /usr/config/SDL-GameControllerDB/gamecontrollerdb.txt \
+      /storage/.config/SDL-GameControllerDB/gamecontrollerdb.txt \
+      /usr/share/SDL2/gamecontrollerdb.txt \
+      /opt/system/Tools/PortMaster/gamecontrollerdb.txt \
+      /storage/roms/ports/PortMaster/gamecontrollerdb.txt
+  do
+    if [ -f "$f" ]; then
+      export SDL_GAMECONTROLLERCONFIG_FILE="$f"
+      break
+    fi
+  done
+fi
+if [ -n "${SDL_GAMECONTROLLERCONFIG_FILE:-}" ]; then
+  echo "pad: controller db $SDL_GAMECONTROLLERCONFIG_FILE"
+fi
 
 # Governor performance：降低音频/引擎卡顿。
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
