@@ -1257,6 +1257,32 @@ static void sw_cheat_apply_ghost(void) {
   sw_cheat_set_status(msg);
 }
 
+/* RoleDataBase 是否已就绪（防止未进游戏时调用 iRoleVar 空指针崩溃）。
+ *
+ * 反汇编 libSWD3E.so 的 iRoleVar（_Z8iRoleVarjjPjj，dynsym st_value=0x12D3B4）：
+ *   +0x00  adrp x8, #0x17a000
+ *   +0x04  ldr  x8, [x8, #0x478]   ; 取角色数据库管理器（全局槽 vaddr=0x17A478）
+ *   +0x08  ldr  x8, [x8]           ; 取角色数组头（RoleDataBase 本体）
+ *   +0x0C  ldr  w9, [x8]           ; ← 未进游戏时 x8=NULL → SIGSEGV si_addr=0
+ * 全局槽 vaddr 0x17A478 位于数据段（数据段 vaddr 起 0x176E40）→ 运行时地址
+ * = data_base + (0x17A478 - 0x176E40) = data_base + 0x3638。
+ *
+ * 触发场景（实机 2026-10-13 复现）：标题画面按 Y 打开作弊面板 → sw_aff_load()
+ * 读好感度 → sw_role_var() → 游戏 iRoleVar() → 空指针解引用（sig=11 MAPERR）。
+ * 此处提前判两级指针，未就绪直接返回 0（下游按"找不到好感数据"处理）。 */
+static int sw_role_db_ready(void) {
+  uintptr_t *slot;
+  uintptr_t *mgr;
+
+  if (!data_base)
+    return 0;
+  slot = (uintptr_t *)((char *)data_base + 0x3638); /* 0x17A478 - 0x176E40 */
+  mgr = (uintptr_t *)*slot;
+  if (!mgr)
+    return 0;
+  return *mgr != 0;
+}
+
 static int sw_role_var(unsigned guid, unsigned var, unsigned *val,
                        unsigned mode) {
   int (*fn)(unsigned, unsigned, unsigned *, unsigned);
@@ -1265,6 +1291,12 @@ static int sw_role_var(unsigned guid, unsigned var, unsigned *val,
       "_Z8iRoleVarjjPjj");
   if (!fn || !val)
     return 0;
+  /* RoleDataBase 未初始化（标题/未进游戏）时调用 fn 会空指针崩溃，先判空。 */
+  if (!sw_role_db_ready()) {
+    if (getenv("SW_CHEAT_VERBOSE"))
+      debugPrintf("[cheat] RoleDataBase 未就绪，跳过 iRoleVar\n");
+    return 0;
+  }
   return fn(guid, var, val, mode);
 }
 

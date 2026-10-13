@@ -52,10 +52,17 @@ docker run --rm -v "$HERE":/work -w /work "$IMAGE" bash -c '
         -o "$o"
   done
   echo "[*] linking -> sword3"
+  # 注意：build/ 目录在多次构建间复用，而下面 libbionic_shim 阶段会编译出
+  # build/libc_compat_shim.o。若用 build/*.o 通配，会把上一轮遗留的该对象一并链入
+  # 主程序 —— 它定义 LIBC 版本节点，进入主程序属前述"无 version script 时静默降级"
+  # 的禁忌，且会让产物随构建次数漂移（2026-10-13 实测：第二次构建导出符号 710→914）。
+  # 故显式排除它。
+  OBJS=$(ls build/*.o | grep -v 'libc_compat_shim\.o$')
+  echo "[*] main objects: $(echo $OBJS | wc -w) 个（不含 libc_compat_shim.o）"
   # 链接命令（硬约束：loader 仅链接设备 SDL2/GLES 用于窗口化，不链接任何随包游戏库；
   # SDL2_image 等仅运行期 RTLD_GLOBAL）。-lpng 为 libbionic_shim 的 PNG 解码 shim
   # （shim_png_from_mem 直接调用 libpng API）所需，属 loader 自身依赖，与 SDL2/GLES 同性质。
-  $CC -fPIE -pie build/*.o \
+  $CC -fPIE -pie $OBJS \
       -lSDL2 -lGLESv2 -lGLESv1_CM \
       -ldl -lm -lpthread -lstdc++ -lgcc_s -lpng \
       -rdynamic -Wl,-rpath,"\$ORIGIN" \
